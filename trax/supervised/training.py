@@ -120,9 +120,8 @@ class Loop:
       eval_model: Optional Trax layer, representing model used for evaluation,
         e.g., with dropout turned off. If None, the training model (model)
         will be used.
-      eval_tasks: List of lists of EvalTask instances, or None. The outer lists
-        goes over training tasks, the inner list contains the eval tasks for
-        a particular train task - so for a particular per-task head.
+      eval_tasks: List of EvalTask instances or None. If None, don't do any
+        evals.
       output_dir: Path telling where to save outputs (evals and checkpoints).
           Can be None if both `eval_task` and `checkpoint_at` are None.
       checkpoint_at: Function (integer --> boolean) telling, for step n, whether
@@ -146,18 +145,11 @@ class Loop:
     if not tasks:
       raise ValueError('Must provide at least one training task.')
     if eval_tasks is None:
-      eval_tasks = ((),) * len(tasks)
+      eval_tasks = []
       eval_at = _never
     else:
       if not isinstance(eval_tasks, (list, tuple)):
-        eval_tasks = [[eval_tasks]]
-      if len(tasks) != len(eval_tasks):
-        raise ValueError('Eval task lists should match with train tasks.')
-      # Allow specifying single eval tasks per head outside of a nested list.
-      eval_tasks = tuple(
-          tasks if isinstance(tasks, (list, tuple)) else (tasks,)
-          for tasks in eval_tasks
-      )
+        eval_tasks = [eval_tasks]
 
     self._tasks = tasks
     self._model = model
@@ -199,10 +191,7 @@ class Loop:
       self._sync_weights_and_state_across_hosts()
 
     # Create the optimizer for the training loss function.
-    self._trainer_per_task = tuple(
-        self._init_trainer(task_index, task)
-        for (task_index, task) in enumerate(tasks)
-    )
+    self._trainer_per_task = tuple(self._init_trainer(task) for task in tasks)
     self.load_checkpoint()
 
     # Prepare eval components.
@@ -211,52 +200,45 @@ class Loop:
     loss_names = [task.loss_layer.name for task in self._tasks]
     metric_names = [
         name  # pylint: disable=g-complex-comprehension
-        for head_eval_tasks in self._eval_tasks
-        for eval_task in head_eval_tasks
+        for eval_task in self._eval_tasks
         for name in eval_task.metric_names
     ]
     self._rjust_len = max(map(len, loss_names + metric_names))
     self._evaluator_per_task = tuple(
-        tuple(  # pylint: disable=g-complex-comprehension
-            self._init_evaluator(train_task_index, eval_task)
-            for eval_task in head_eval_tasks
-        )
-        for (train_task_index, head_eval_tasks) in enumerate(self._eval_tasks)
-    )
+        self._init_evaluator(eval_task) for eval_task in self._eval_tasks)
 
     if self._output_dir is None:
       _log('Will not write evaluation metrics, because output_dir is None.')
 
-    def task_output_dir(task_index):
+    def eval_task_output_dir(task_index):
       if self._output_dir is not None:
-        output_dir = os.path.join(self._output_dir, str(task_index))
+        if len(eval_tasks) < 2:
+          output_dir = self._output_dir
+        else:
+          output_dir = os.path.join(self._output_dir, str(task_index))
         tf.io.gfile.makedirs(output_dir)
         return output_dir
       else:
         return None
     self._output_dir_per_task = tuple(
-        map(task_output_dir, range(len(eval_tasks)))
+        map(eval_task_output_dir, range(len(eval_tasks)))
     )
 
-  def _select_head(self, model, head_index):
-    return tl.Serial(model, tl.Select([head_index], n_in=len(self._tasks)))
-
-  def _init_trainer(self, head_index, task):
+  def _init_trainer(self, task):
     """Initializes the per-task trainer."""
     # Build the per-task model, sharing weights with other tasks.
     model_in_training = _model_with_ends(
-        self._select_head(self._model, head_index),
+        self._model,
         [task.loss_layer],
         shapes.signature(task.sample_batch)
     )
     task.optimizer.tree_init(model_in_training.weights)
     return optimizers.Trainer(model_in_training, task.optimizer)
 
-  def _init_evaluator(self, head_index, eval_task):
+  def _init_evaluator(self, eval_task):
     """Initializes the per-task evaluator."""
     model_with_metrics = _model_with_metrics(
-        self._select_head(self._eval_model, head_index), eval_task
-    )
+        self._eval_model, eval_task)
     return _Evaluator(
         # Replicate the eval part of weights and state.
         weights=self._for_n_devices(model_with_metrics.weights[1]),
@@ -508,8 +490,7 @@ class Loop:
       model_state = trainer.accelerated_loss_layer.state[0]
 
       for (eval_task, evaluator) in zip(
-          self._eval_tasks[task_index], self._evaluator_per_task[task_index]
-      ):
+          self._eval_tasks, self._evaluator_per_task):
         # evaluator.{weights,state} are already replicated.
         metrics_weights = (model_weights, evaluator.weights)
         metrics_state = (model_state, evaluator.state)
